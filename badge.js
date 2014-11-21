@@ -17,13 +17,26 @@ canvasContext.font = '11px Verdana, "DejaVu Sans"';
 
 // cache templates.
 var templates = {};
-var templateFiles = fs.readdirSync('templates');
+var templateFiles = fs.readdirSync(path.join(__dirname, 'templates'));
+dot.templateSettings.strip = false;  // Do not strip whitespace.
 templateFiles.forEach(function(filename) {
   var templateData = fs.readFileSync(
     path.join(__dirname, 'templates', filename)).toString();
-  var style = filename.slice(0, -('-template.svg'.length));
-  templates[style] = dot.template(templateData);
+  var extension = filename.split('.').pop();
+  var style = filename.slice(0, -(('-template.' + extension).length));
+  templates[style + '-' + extension] = dot.template(templateData);
 });
+
+function escapeXml(s) {
+  return s.replace(/&/g, '&amp;')
+          .replace(/</g, '&lt;')
+          .replace(/>/g, '&gt;')
+          .replace(/"/g, '&quot;')
+          .replace(/'/g, '&apos;');
+}
+function addEscapers(data) {
+  data.escapeXml = escapeXml;
+}
 
 var colorscheme = require(path.join(__dirname, 'colorscheme.json'));
 
@@ -33,19 +46,43 @@ function optimize(string, callback) {
 }
 
 function makeImage(data, cb) {
-  var template = templates[data.template];
-  if (template == null) { template = templates['default']; }
-  if (data.colorscheme) {
-    data.colorA = colorscheme[data.colorscheme].colorA;
-    data.colorB = colorscheme[data.colorscheme].colorB;
+  if (data.format !== 'json') {
+    data.format = 'svg';
   }
+  if (!(data.template + '-' + data.format in templates)) {
+    data.template = 'default';
+  }
+  if (data.colorscheme) {
+    var pickedColorscheme = colorscheme[data.colorscheme];
+    if (!pickedColorscheme) {
+      pickedColorscheme = colorscheme.red;
+    }
+    data.colorA = pickedColorscheme.colorA;
+    data.colorB = pickedColorscheme.colorB;
+  }
+  // String coercion.
+  data.text[0] = '' + data.text[0];
+  data.text[1] = '' + data.text[1];
   data.widths = [
     (canvasContext.measureText(data.text[0]).width|0) + 10,
     (canvasContext.measureText(data.text[1]).width|0) + 10,
   ];
-  var result = template(data);
-  // Run the SVG through SVGO.
-  optimize(result, function(object) { cb(object.data); });
+
+  var template = templates[data.template + '-' + data.format];
+  addEscapers(data);
+  try {
+    var result = template(data);
+  } catch(e) {
+    cb('', e);
+    return;
+  }
+
+  if (data.format === 'json') {
+    cb(result);
+  } else {
+    // Run the SVG through SVGO.
+    optimize(result, function(object) { cb(object.data); });
+  }
 }
 
 module.exports = makeImage;

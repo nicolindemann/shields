@@ -19,7 +19,7 @@ npm install gh-badges
 ```js
 var badge = require('gh-badges');
 badge({ text: [ "build", "passed" ], colorscheme: "green" },
-  function(svg) {
+  function(svg, err) {
     // svg is a String… of your badge.
   });
 ```
@@ -33,17 +33,17 @@ badge build passed :green .png > mybadge.png
 ```
 
 # Start the Server
-To run the server you will the following executables on your Path:
+To run the server you will need the following executables on your Path:
 - [PhantomJS](http://www.phantomjs.org/)
 - [Cairo](http://cairographics.org/) (runtime dependency for Canvas)
 
-On a OS X machine, [Homebrew](brew.sh) is a good package manager that will 
+On an OS X machine, [Homebrew](brew.sh) is a good package manager that will
 allow you to install them.
 
 ```bash
 git clone git@github.com:badges/shields
 cd shields
-npm install
+npm install  # You may need sudo for this.
 sudo node server
 ```
 
@@ -68,6 +68,7 @@ The format is the following:
 {
   /* Textual information shown, in order. */
   "text": [ "build", "passed" ],
+  "format": "svg",  // Also supports "json".
   "colorscheme": "green"
   /* … Or… */
   "colorA": "#555",
