@@ -296,7 +296,7 @@ cache(function(data, match, sendBadge, request) {
       } else if (res === 'failing') {
         badgeData.colorscheme = 'red';
       } else {
-        badgeData.text[1] = 'pending';
+        badgeData.text[1] = res;
       }
       sendBadge(format, badgeData);
 
@@ -341,6 +341,77 @@ cache(function(data, match, sendBadge, request) {
       sendBadge(format, badgeData);
 
     } catch(e) {
+      badgeData.text[1] = 'invalid';
+      sendBadge(format, badgeData);
+    }
+  });
+}));
+
+// Rust download and version integration
+camp.route(/^\/crates\/(d|v|dv|l)\/([A-Za-z0-9_-]+)(?:\/([0-9.]+))?\.(svg|png|gif|jpg|json)$/,
+cache(function (data, match, sendBadge, request) {
+  var mode = match[1];  // d - downloads (total or for version), v - (latest) version, dv - downloads (for latest version)
+  var crate = match[2];  // crate name, e.g. rustc-serialize
+  var version = match[3];  // crate version in semver format, optional, e.g. 0.1.2
+  var format = match[4];
+  var modes = {
+    'd': {
+      name: 'downloads',
+      version: true,
+      process: function (data, badgeData) {
+        downloads = data.crate? data.crate.downloads: data.version.downloads;
+        version = data.version && data.version.num;
+        badgeData.text[1] = metric(downloads) + (version? ' version ' + version: ' total');
+        badgeData.colorscheme = downloadCountColor(downloads);
+      }
+    },
+    'dv': {
+      name: 'downloads',
+      version: true,
+      process: function (data, badgeData) {
+        downloads = data.version? data.version.downloads: data.versions[0].downloads;
+        version = data.version && data.version.num;
+        badgeData.text[1] = metric(downloads) + (version? ' version ' + version: ' latest version');
+        badgeData.colorscheme = downloadCountColor(downloads);
+      }
+    },
+    'v': {
+      name: 'crates.io',
+      version: true,
+      process: function (data, badgeData) {
+        version = data.version? data.version.num: data.crate.max_version;
+        var vdata = versionColor(version);
+        badgeData.text[1] = vdata.version;
+        badgeData.colorscheme = vdata.color;
+      }
+    },
+    'l': {
+      name: 'license',
+      version: false,
+      process: function (data, badgeData) {
+        badgeData.text[1] = data.crate.license;
+        badgeData.colorscheme = 'blue';
+      }
+    }
+  };
+  var behavior = modes[mode];
+  var apiUrl = 'https://crates.io/api/v1/crates/' + crate;
+  if (version != null && behavior.version) {
+    apiUrl += '/' + version;
+  }
+
+  var badgeData = getBadgeData(behavior.name, data);
+  request(apiUrl, { headers: { 'Accept': 'application/json' } }, function (err, res, buffer) {
+    if (err != null) {
+      badgeData.text[1] = 'inaccessible';
+      sendBadge(badgeData, format);
+    }
+    try {
+      var data = JSON.parse(buffer);
+      behavior.process(data, badgeData);
+      sendBadge(format, badgeData);
+
+    } catch (e) {
       badgeData.text[1] = 'invalid';
       sendBadge(format, badgeData);
     }
@@ -729,18 +800,18 @@ cache(function(data, match, sendBadge, request) {
     try {
       var data = JSON.parse(buffer);
       switch (info.charAt(1)) {
-        case 'm':
-          var downloads = data.package.downloads.monthly;
-          badgeData.text[1] = metric(downloads) + '/month';
-          break;
-        case 'd':
-          var downloads = data.package.downloads.daily;
-          badgeData.text[1] = metric(downloads) + '/day';
-          break;
-        case 't':
-          var downloads = data.package.downloads.total;
-          badgeData.text[1] = metric(downloads) + ' total';
-          break;
+      case 'm':
+        var downloads = data.package.downloads.monthly;
+        badgeData.text[1] = metric(downloads) + '/month';
+        break;
+      case 'd':
+        var downloads = data.package.downloads.daily;
+        badgeData.text[1] = metric(downloads) + '/day';
+        break;
+      case 't':
+        var downloads = data.package.downloads.total;
+        badgeData.text[1] = metric(downloads) + ' total';
+        break;
       }
       badgeData.colorscheme = downloadCountColor(downloads);
       sendBadge(format, badgeData);
@@ -752,10 +823,11 @@ cache(function(data, match, sendBadge, request) {
 }));
 
 // Packagist version integration.
-camp.route(/^\/packagist\/v\/(.*)\.(svg|png|gif|jpg|json)$/,
+camp.route(/^\/packagist\/(v|vpre)\/(.*)\.(svg|png|gif|jpg|json)$/,
 cache(function(data, match, sendBadge, request) {
-  var userRepo = match[1];  // eg, `doctrine/orm`.
-  var format = match[2];
+  var info = match[1];  // either `v` or `vpre`.
+  var userRepo = match[2];  // eg, `doctrine/orm`.
+  var format = match[3];
   var apiUrl = 'https://packagist.org/packages/' + userRepo + '.json';
   var badgeData = getBadgeData('packagist', data);
   request(apiUrl, function(err, res, buffer) {
@@ -765,19 +837,62 @@ cache(function(data, match, sendBadge, request) {
     }
     try {
       var data = JSON.parse(buffer);
-      var unstable = function(ver) { return /dev/.test(ver); };
-      // Grab the latest stable version, or an unstable
-      var versions = Object.keys(data.package.versions);
-      var version = latestVersion(versions);
-      badgeData.text[1] = version;
-      if (/^\d/.test(badgeData.text[1])) {
-        badgeData.text[1] = 'v' + version;
+
+      var versionsData = data.package.versions;
+      var versions = Object.keys(versionsData);
+
+      // Map aliases (eg, dev-master).
+      var aliasesMap = {};
+      versions.forEach(function(version) {
+        var versionData = versionsData[version];
+        if (versionData.extra && versionData.extra['branch-alias'] &&
+            versionData.extra['branch-alias'][version]) {
+          // eg, version is 'dev-master', mapped to '2.0.x-dev'.
+          var validVersion = versionData.extra['branch-alias'][version];
+          if (aliasesMap[validVersion] === undefined ||
+              phpVersionCompare(aliasesMap[validVersion], validVersion) < 0) {
+            versions.push(validVersion);
+            aliasesMap[validVersion] = version;
+          }
+        }
+      });
+      versions = versions.filter(function(version) {
+        return !(/^dev-/.test(version));
+      });
+
+      var badgeText = null;
+      var badgeColor = null;
+
+      switch (info) {
+      case 'v':
+        var stableVersions = versions.filter(phpStableVersion);
+        var stableVersion = phpLatestVersion(stableVersions);
+        if (!stableVersion) {
+          stableVersion = phpLatestVersion(versions);
+        }
+        //if (!!aliasesMap[stableVersion]) {
+        //  stableVersion = aliasesMap[stableVersion];
+        //}
+        var vdata = versionColor(stableVersion);
+        badgeText = vdata.version;
+        badgeColor = vdata.color;
+        break;
+      case 'vpre':
+        var unstableVersion = phpLatestVersion(versions);
+        //if (!!aliasesMap[unstableVersion]) {
+        //  unstableVersion = aliasesMap[unstableVersion];
+        //}
+        var vdata = versionColor(unstableVersion);
+        badgeText = vdata.version;
+        badgeColor = 'orange';
+        break;
       }
-      if (version[0] === '0' || /dev/.test(version)) {
-        badgeData.colorscheme = 'orange';
-      } else {
-        badgeData.colorscheme = 'blue';
+
+      if (badgeText !== null) {
+        badgeData.text[1] = badgeText;
+        badgeData.colorscheme = badgeColor;
       }
+
       sendBadge(format, badgeData);
     } catch(e) {
       badgeData.text[1] = 'invalid';
@@ -881,12 +996,9 @@ cache(function(data, match, sendBadge, request) {
     try {
       var data = JSON.parse(buffer);
       var version = data.version;
-      badgeData.text[1] = 'v' + version;
-      if (version[0] === '0' || /dev/.test(version)) {
-        badgeData.colorscheme = 'orange';
-      } else {
-        badgeData.colorscheme = 'blue';
-      }
+      var vdata = versionColor(version);
+      badgeData.text[1] = vdata.version;
+      badgeData.colorscheme = vdata.color;
       sendBadge(format, badgeData);
     } catch(e) {
       badgeData.text[1] = 'invalid';
@@ -947,18 +1059,23 @@ cache(function(data, match, sendBadge, request) {
         regularUpdate('http://nodejs.org/dist/latest/SHASUMS.txt',
           (24 * 3600 * 1000),
           function(shasums) {
-            var firstLine = shasums.slice(0, shasums.indexOf('\n'));
-            var version = firstLine.split('  ')[1].split('-')[1];
+            // tarball index start, tarball index end
+            var taris = shasums.indexOf('node-v');
+            var tarie = shasums.indexOf('\n', taris);
+            var tarball = shasums.slice(taris, tarie);
+            var version = tarball.split('-')[1];
             return version;
           }, function(err, version) {
             if (err != null) { sendBadge(format, badgeData); return; }
-            if (semver.satisfies(version, versionRange)) {
-              badgeData.colorscheme = 'brightgreen';
-            } else if (semver.gtr(version, versionRange)) {
-              badgeData.colorscheme = 'yellow';
-            } else {
-              badgeData.colorscheme = 'orange';
-            }
+            try {
+              if (semver.satisfies(version, versionRange)) {
+                badgeData.colorscheme = 'brightgreen';
+              } else if (semver.gtr(version, versionRange)) {
+                badgeData.colorscheme = 'yellow';
+              } else {
+                badgeData.colorscheme = 'orange';
+              }
+            } catch(e) { }
             sendBadge(format, badgeData);
         });
       } else {
@@ -986,12 +1103,9 @@ cache(function(data, match, sendBadge, request) {
     try {
       var data = JSON.parse(buffer);
       var version = data.version;
-      badgeData.text[1] = 'v' + version;
-      if (version[0] === '0' || /dev/.test(version)) {
-        badgeData.colorscheme = 'orange';
-      } else {
-        badgeData.colorscheme = 'blue';
-      }
+      var vdata = versionColor(version);
+      badgeData.text[1] = vdata.version;
+      badgeData.colorscheme = vdata.color;
       sendBadge(format, badgeData);
     } catch(e) {
       badgeData.text[1] = 'invalid';
@@ -1071,6 +1185,31 @@ cache(function(data, match, sendBadge, request) {
   });
 }));
 
+// Gem owner stats
+camp.route(/^\/gem\/u\/(.*)\.(svg|png|gif|jpg|json)$/,
+cache(function(data, match, sendBadge, request) {
+  var user = match[1]; // eg, "raphink"
+  var format = match[2];
+  var url = 'https://rubygems.org/api/v1/owners/' + user + '/gems.json';
+  var badgeData = getBadgeData('gems', data);
+  request(url, function(err, res, buffer) {
+    if (err != null) {
+      badgeData.text[1] = 'inaccessible';
+      sendBadge(badgeData, format);
+    }
+    try {
+      var data = JSON.parse(buffer);
+      var count = data.length;
+      badgeData.colorscheme = floorCountColor(count, 10, 50, 100);
+      badgeData.text[1] = count;
+      sendBadge(format, badgeData);
+    } catch (e) {
+      badgeData.text[1] = 'invalid';
+      sendBadge(format, badgeData);
+    }
+  })
+}));
+
 // PyPI integration.
 camp.route(/^\/pypi\/([^\/]+)\/(.*)\.(svg|png|gif|jpg|json)$/,
 cache(function(data, match, sendBadge, request) {
@@ -1106,12 +1245,9 @@ cache(function(data, match, sendBadge, request) {
         sendBadge(format, badgeData);
       } else if (info === 'v') {
         var version = data.info.version;
-        badgeData.text[1] = 'v' + version;
-        if (version[0] === '0' || /dev/.test(version)) {
-          badgeData.colorscheme = 'orange';
-        } else {
-          badgeData.colorscheme = 'blue';
-        }
+        var vdata = versionColor(version);
+        badgeData.text[1] = vdata.version;
+        badgeData.colorscheme = vdata.color;
         sendBadge(format, badgeData);
       } else if (info == 'l') {
         var license = data.info.license;
@@ -1148,15 +1284,9 @@ cache(function(data, match, sendBadge, request) {
       // Grab the latest stable version, or an unstable
       var versions = data.versions;
       var version = latestVersion(versions);
-      badgeData.text[1] = version;
-      if (/^\d/.test(badgeData.text[1])) {
-        badgeData.text[1] = 'v' + version;
-      }
-      if (version[0] === '0' || /dev/.test(version)) {
-        badgeData.colorscheme = 'orange';
-      } else {
-        badgeData.colorscheme = 'blue';
-      }
+      var vdata = versionColor(version);
+      badgeData.text[1] = vdata.version;
+      badgeData.colorscheme = vdata.color;
       sendBadge(format, badgeData);
     } catch(e) {
       badgeData.text[1] = 'invalid';
@@ -1200,12 +1330,9 @@ cache(function(data, match, sendBadge, request) {
         sendBadge(format, badgeData);
       } else if (info === 'v') {
         var version = data.releases[0].version;
-        badgeData.text[1] = 'v' + version;
-        if (version[0] === '0' || /dev/.test(version)) {
-          badgeData.colorscheme = 'orange';
-        } else {
-          badgeData.colorscheme = 'blue';
-        }
+        var vdata = versionColor(version);
+        badgeData.text[1] = vdata.version;
+        badgeData.colorscheme = vdata.color;
         sendBadge(format, badgeData);
       } else if (info == 'l') {
         var license = (data.meta.licenses || []).join(', ');
@@ -1283,7 +1410,7 @@ cache(function(data, match, sendBadge, request) {
   var branch = match[2];
   var format = match[3];
   var apiUrl = {
-    url: 'https://codecov.io/' + userRepo + '/coverage.png',
+    url: 'https://codecov.io/' + userRepo + '/coverage.svg',
     followRedirect: false,
     method: 'HEAD',
   };
@@ -1789,17 +1916,9 @@ cache(function(data, match, sendBadge, request) {
       }
       var data = JSON.parse(buffer);
       var tag = data[0].name;
-      badgeData.text[1] = tag;
-      badgeData.colorscheme = 'blue';
-      if (/^v[0-9]/.test(tag)) {
-        tag = tag.slice(1);
-      }
-      if (/^[0-9]/.test(tag)) {
-        badgeData.text[1] = 'v' + tag;
-        if (tag[0] === '0' || /dev/.test(tag)) {
-          badgeData.colorscheme = 'orange';
-        }
-      }
+      var vdata = versionColor(tag);
+      badgeData.text[1] = vdata.version;
+      badgeData.colorscheme = vdata.color;
       sendBadge(format, badgeData);
     } catch(e) {
       badgeData.text[1] = 'none';
@@ -1814,7 +1933,7 @@ cache(function(data, match, sendBadge, request) {
   var user = match[1];  // eg, qubyte/rubidium
   var repo = match[2];
   var format = match[3];
-  var apiUrl = 'https://api.github.com/repos/' + user + '/' + repo + '/releases';
+  var apiUrl = 'https://api.github.com/repos/' + user + '/' + repo + '/releases/latest';
   // Using our OAuth App secret grants us 5000 req/hour
   // instead of the standard 60 req/hour.
   if (serverSecrets) {
@@ -1834,22 +1953,11 @@ cache(function(data, match, sendBadge, request) {
         return;  // Hope for the best in the cache.
       }
       var data = JSON.parse(buffer);
-      var versions = data.map(function(version) { return version.tag_name; });
-      var version = latestVersion(versions);
-      var prerelease = !!data.filter(function(versionData) {
-        return version === versionData.tag_name;
-      })[0].prerelease;
-      badgeData.text[1] = version;
+      var version = data.tag_name;
+      var prerelease = data.prerelease;
+      var vdata = versionColor(version);
+      badgeData.text[1] = vdata.version;
       badgeData.colorscheme = prerelease ? 'orange' : 'blue';
-      if (/^v[0-9]/.test(version)) {
-        version = version.slice(1);
-      }
-      if (/^[0-9]/.test(version)) {
-        badgeData.text[1] = 'v' + version;
-        if (version[0] === '0' || /dev/.test(version)) {
-          badgeData.colorscheme = 'orange';
-        }
-      }
       sendBadge(format, badgeData);
     } catch(e) {
       badgeData.text[1] = 'none';
@@ -1970,6 +2078,41 @@ cache(function(data, match, sendBadge, request) {
   });
 }));
 
+// GitHub user followers integration.
+camp.route(/^\/github\/followers\/([^\/]+)\.(svg|png|gif|jpg|json)$/,
+cache(function(data, match, sendBadge, request) {
+  var user = match[1];  // eg, qubyte
+  var format = match[2];
+  var apiUrl = 'https://api.github.com/users/' + user;
+  // Using our OAuth App secret grants us 5000 req/hour
+  // instead of the standard 60 req/hour.
+  if (serverSecrets) {
+    apiUrl += '?client_id=' + serverSecrets.gh_client_id
+      + '&client_secret=' + serverSecrets.gh_client_secret;
+  }
+  var badgeData = getBadgeData('followers', data);
+  // A special User-Agent is required:
+  // http://developer.github.com/v3/#user-agent-required
+  request(apiUrl, { headers: githubHeaders }, function(err, res, buffer) {
+    if (err != null) {
+      badgeData.text[1] = 'inaccessible';
+      sendBadge(format, badgeData);
+    }
+    try {
+      if ((+res.headers['x-ratelimit-remaining']) === 0) {
+        return;  // Hope for the best in the cache.
+      }
+      badgeData.text[1] = JSON.parse(buffer).followers;
+      badgeData.colorscheme = null;
+      badgeData.colorB = '#4183C4';
+      sendBadge(format, badgeData);
+    } catch(e) {
+      badgeData.text[1] = 'invalid';
+      sendBadge(format, badgeData);
+    }
+  });
+}));
+
 // Chef cookbook integration.
 camp.route(/^\/cookbook\/v\/(.*)\.(svg|png|gif|jpg|json)$/,
 cache(function(data, match, sendBadge, request) {
@@ -1987,12 +2130,9 @@ cache(function(data, match, sendBadge, request) {
     try {
       var data = JSON.parse(buffer);
       var version = data.version;
-      badgeData.text[1] = 'v' + version;
-      if (version[0] === '0' || /dev/.test(version)) {
-        badgeData.colorscheme = 'orange';
-      } else {
-        badgeData.colorscheme = 'blue';
-      }
+      var vdata = versionColor(version);
+      badgeData.text[1] = vdata.version;
+      badgeData.colorscheme = vdata.color;
       sendBadge(format, badgeData);
     } catch(e) {
       badgeData.text[1] = 'invalid';
@@ -2144,14 +2284,16 @@ mapNugetFeed('myget\\/(.*)', 1, function(match) {
   };
 });
 
-// Puppet Forge
-camp.route(/^\/puppetforge\/v\/([^\/]+\/[^\/]+)\.(svg|png|gif|jpg|json)$/,
+// Puppet Forge modules
+camp.route(/^\/puppetforge\/([^\/]+)\/([^\/]+)\/([^\/]+)\.(svg|png|gif|jpg|json)$/,
 cache(function(data, match, sendBadge, request) {
-  var userRepo = match[1];
-  var format = match[2];
+  var info = match[1]; // either `v`, `dt`, `e` or `f`
+  var user = match[2];
+  var module = match[3];
+  var format = match[4];
   var options = {
     json: true,
-    uri: 'https://forge.puppetlabs.com/api/v1/releases.json?module=' + userRepo
+    uri: 'https://forgeapi.puppetlabs.com/v3/modules/' + user + '-' + module
   };
   var badgeData = getBadgeData('puppetforge', data);
   request(options, function dealWithData(err, res, json) {
@@ -2161,26 +2303,83 @@ cache(function(data, match, sendBadge, request) {
       return;
     }
     try {
-      var unstable = function(ver) {
-        return /-[0-9A-Za-z.-]+(?:\+[0-9A-Za-z.-]+)?$/.test(ver);
-      };
-      var releases = json[userRepo];
-      if (releases.length == 0) {
-        badgeData.text[1] = 'none';
-        badgeData.colorscheme = 'lightgrey';
-        sendBadge(format, badgeData);
-        return;
+      if (info === 'v') {
+        if (json.current_release) {
+          var vdata = versionColor(json.current_release.version);
+          badgeData.text[1] = vdata.version;
+          badgeData.colorscheme = vdata.color;
+        } else {
+          badgeData.text[1] = 'none';
+          badgeData.colorscheme = 'lightgrey';
+        }
+      } else if (info === 'dt') {
+        var total = json.downloads;
+        badgeData.colorscheme = downloadCountColor(total);
+        badgeData.text[0] = 'downloads';
+        badgeData.text[1] = metric(total) + ' total';
+      } else if (info === 'e') {
+        var endorsement = json.endorsement;
+        if (endorsement === 'approved') {
+          badgeData.colorscheme = 'green';
+        } else if (endorsement === 'supported') {
+          badgeData.colorscheme = 'brightgreen';
+        } else {
+          badgeData.colorscheme = 'red';
+        }
+        badgeData.text[0] = 'endorsement';
+        if (endorsement != null) {
+          badgeData.text[1] = endorsement;
+        } else {
+          badgeData.text[1] = 'none';
+        }
+      } else if (info === 'f') {
+        var feedback = json.feedback_score;
+        badgeData.text[0] = 'score';
+        if (feedback != null) {
+          badgeData.text[1] = feedback + '%';
+          badgeData.colorscheme = coveragePercentageColor(feedback);
+        } else {
+          badgeData.text[1] = 'unknown';
+          badgeData.colorscheme = 'lightgrey';
+        }
       }
-      var versions = releases.map(function(version) {
-        return version.version;
-      });
-      var version = latestVersion(versions);
-      if (unstable(version)) {
-        badgeData.colorscheme = "yellow";
-      } else {
-        badgeData.colorscheme = "blue";
+      sendBadge(format, badgeData);
+    } catch(e) {
+      badgeData.text[1] = 'invalid';
+      sendBadge(format, badgeData);
+    }
+  });
+}));
+
+// Puppet Forge users
+camp.route(/^\/puppetforge\/([^\/]+)\/([^\/]+)\.(svg|png|gif|jpg|json)$/,
+cache(function(data, match, sendBadge, request) {
+  var info = match[1]; // either `rc` or `mc`
+  var user = match[2];
+  var format = match[3];
+  var options = {
+    json: true,
+    uri: 'https://forgeapi.puppetlabs.com/v3/users/' + user
+  };
+  var badgeData = getBadgeData('puppetforge', data);
+  request(options, function dealWithData(err, res, json) {
+    if (err != null || (json.length !== undefined && json.length === 0)) {
+      badgeData.text[1] = 'inaccessible';
+      sendBadge(format, badgeData);
+      return;
+    }
+    try {
+      if (info === 'rc') {
+        var releases = json.release_count;
+        badgeData.colorscheme = floorCountColor(releases, 10, 50, 100);
+        badgeData.text[0] = 'releases';
+        badgeData.text[1] = metric(releases);
+      } else if (info === 'mc') {
+        var modules = json.module_count;
+        badgeData.colorscheme = floorCountColor(modules, 5, 10, 50);
+        badgeData.text[0] = 'modules';
+        badgeData.text[1] = metric(modules);
       }
-      badgeData.text[1] = "v" + version;
       sendBadge(format, badgeData);
 
     } catch(e) {
@@ -2387,12 +2586,9 @@ cache(function(data, match, sendBadge, request) {
     })
     .on('end', function(version) {
       try {
-        badgeData.text[1] = 'v' + version;
-        if (version[0] === '0' || /dev/.test(version)) {
-          badgeData.colorscheme = 'orange';
-        } else {
-          badgeData.colorscheme = 'blue';
-        }
+        var vdata = versionColor(version);
+        badgeData.text[1] = vdata.version;
+        badgeData.colorscheme = vdata.color;
         sendBadge(format, badgeData);
       } catch(e) {
         badgeData.text[1] = 'void';
@@ -2781,6 +2977,136 @@ cache(function(data, match, sendBadge, request) {
   });
 }));
 
+// CircleCI build integration.
+// https://circleci.com/api/v1/project/BrightFlair/PHP.Gt?circle-token=0a5143728784b263d9f0238b8d595522689b3af2&limit=1&filter=completed
+camp.route(/^\/circleci\/project\/([^\/]+\/[^\/]+)(?:\/(.*))?\.(svg|png|gif|jpg|json)$/,
+cache(function(data, match, sendBadge, request) {
+  var userRepo = match[1];  // eg, `BrightFlair/PHP.Gt`.
+  var branch = match[2];
+  var format = match[3];
+
+  var apiUrl = 'https://circleci.com/api/v1/project/' + userRepo;
+  if(branch != null) {
+    apiUrl +=
+      "/tree/"
+      + branch;
+  }
+  apiUrl +=
+    '?circle-token=0a5143728784b263d9f0238b8d595522689b3af2'
+    + '&limit=1&filter=completed';
+
+  var badgeData = getBadgeData('build', data);
+
+  request(apiUrl, {json:true}, function(err, res, data) {
+    if (err != null) {
+      badgeData.text[1] = 'inaccessible';
+      sendBadge(format, badgeData);
+    }
+    try {
+      var status = data[0].status;
+      switch(status) {
+      case 'success':
+      case 'fixed':
+        badgeData.colorscheme = 'brightgreen';
+        badgeData.text[1] = 'passing';
+        break;
+
+      case 'failed':
+        badgeData.colorscheme = 'red';
+        badgeData.text[1] = 'failed';
+        break;
+
+      case 'no_tests':
+      case 'scheduled':
+      case 'not_run':
+        badgeData.colorscheme = 'yellow';
+      default:
+        badgeData.text[1] = status.replace('_', ' ');
+        break;
+      }
+
+      sendBadge(format, badgeData);
+    } catch(e) {
+      badgeData.text[1] = 'invalid';
+      sendBadge(format, badgeData);
+    }
+  });
+}));
+
+// CPAN integration.
+camp.route(/^\/cpan\/([^\/]+)\/([^\/]+)\.(svg|png|gif|jpg|json)$/,
+cache(function(data, match, sendBadge, request) {
+  var info = match[1]; // either `v` or `l`
+  var pkg = match[2]; // eg, Config-Augeas
+  var format = match[3];
+  var badgeData = getBadgeData('cpan', data);
+  var url = 'https://api.metacpan.org/v0/release/'+pkg;
+  request(url, function(err, res, buffer) {
+    if (err != null) {
+      badgeData.text[1] = 'inaccessible';
+      sendBadge(format, badgeData);
+      return;
+    }
+    try {
+      var data = JSON.parse(buffer);
+
+      if (info === 'v') {
+        var version = data.version;
+        var vdata = versionColor(version);
+        badgeData.text[1] = vdata.version;
+        badgeData.colorscheme = vdata.color;
+      } else if (info === 'l') {
+        var license = data.license[0];
+        badgeData.text[1] = license;
+        badgeData.colorscheme = 'blue';
+      }
+      sendBadge(format, badgeData);
+    } catch(e) {
+      badgeData.text[1] = 'invalid';
+      sendBadge(format, badgeData);
+    }
+  });
+}));
+
+// CTAN integration.
+camp.route(/^\/ctan\/([^\/])\/([^\/]+)\.(svg|png|gif|jpg|json)$/,
+cache(function(data, match, sendBadge, request) {
+  var info = match[1]; // either `v` or `l`
+  var pkg = match[2]; // eg, tex
+  var format = match[3];
+  var url = 'http://www.ctan.org/json/pkg/'+pkg;
+  var badgeData = getBadgeData('ctan', data);
+  request(url, function (err, res, buffer) {
+    if (err != null) {
+      badgeData.text[1] = 'inaccessible';
+      sendBadge(badgeData, format);
+    }
+    try {
+      var data = JSON.parse(buffer);
+
+      if (info === 'v') {
+        var version = data.version.number;
+        var vdata = versionColor(version);
+        badgeData.text[1] = vdata.version;
+        badgeData.colorscheme = vdata.color;
+        sendBadge(format, badgeData);
+      } else if (info === 'l') {
+        var license = data.license;
+        if (license === '') {
+          badgeData.text[1] = 'Unknown';
+        } else {
+          badgeData.text[1] = license;
+          badgeData.colorscheme = 'blue';
+        }
+        sendBadge(format, badgeData);
+      }
+    } catch (e) {
+      badgeData.text[1] = 'invalid';
+      sendBadge(format, badgeData);
+    }
+  })}
+));
+
 // Any badge.
 camp.route(/^\/(:|badge\/)(([^-]|--)+)-(([^-]|--)+)-(([^-]|--)+)\.(svg|png|gif|jpg)$/,
 function(data, match, end, ask) {
@@ -2986,28 +3312,38 @@ function fetchFromSvg(request, url, cb) {
 }
 
 function coveragePercentageColor(percentage) {
-  if (percentage < 80) {
+  return floorCountColor(percentage, 80, 90, 100);
+}
+
+function downloadCountColor(downloads) {
+  return floorCountColor(downloads, 10, 100, 1000);
+}
+
+function floorCountColor(value, yellow, yellowgreen, green) {
+  if (value === 0) {
+    return 'red';
+  } else if (value < yellow) {
     return 'yellow';
-  } else if (percentage < 90) {
+  } else if (value < yellowgreen) {
     return 'yellowgreen';
-  } else if (percentage < 100) {
+  } else if (value < green) {
     return 'green';
   } else {
     return 'brightgreen';
   }
 }
 
-function downloadCountColor(downloads) {
-  if (downloads === 0) {
-    return 'red';
-  } else if (downloads < 10) {
-    return 'yellow';
-  } else if (downloads < 100) {
-    return 'yellowgreen';
-  } else if (downloads < 1000) {
-    return 'green';
+function versionColor(version) {
+  var first = version[0];
+  if (first === 'v') {
+    first = version[1];
+  } else if (/^[0-9]/.test(version)) {
+    version = 'v' + version;
+  }
+  if (first === '0' || (version.indexOf('-') !== -1)) {
+    return { version: version, color: 'orange' };
   } else {
-    return 'brightgreen';
+    return { version: version, color: 'blue' };
   }
 }
 
@@ -3017,7 +3353,7 @@ function latestVersion(versions) {
   versions = versions.filter(function(version) {
     return (/^v?[0-9]/).test(version);
   });
-  versions = versions.map(function(version) {
+  semver_versions = versions.map(function(version) {
     var matches = /^(v?[0-9]+)(\.[0-9]+)?(-.*)?$/.exec(version);
     if (matches) {
         version = matches[1] + (matches[2] ? matches[2] : '.0') + '.0' + (matches[3] ? matches[3] : '');
@@ -3025,10 +3361,196 @@ function latestVersion(versions) {
     return version;
   });
   try {
-    version = semver.maxSatisfying(versions, '');
+    version = semver.maxSatisfying(semver_versions, '');
+    version = versions[semver_versions.indexOf(version)];
   } catch(e) {
     versions = versions.sort();
     version = versions[versions.length - 1];
   }
   return version;
+}
+
+// Return a negative value if v1 < v2,
+// zero if v1 = v2, a positive value otherwise.
+function asciiVersionCompare(v1, v2) {
+  if (v1 < v2) {
+    return -1;
+  } else if (v1 > v2) {
+    return 1;
+  } else {
+    return 0;
+  }
+}
+
+// Remove the starting v in a string.
+function omitv(version) {
+  if (version.charCodeAt(0) === 118) { // v
+    return version.slice(1);
+  } else {
+    return version;
+  }
+}
+
+// Take a version without the starting v.
+// eg, '1.0.x-beta'
+// Return { numbers: [1,0,something big], modifier: 2, modifierCount: 1 }
+function phpNumberedVersionData(version) {
+  // A version has a numbered part and a modifier part
+  // (eg, 1.0.0-patch, 2.0.x-dev).
+  var parts = version.split('-');
+  var numbered = parts[0];
+
+  // Aliases that get caught here.
+  if (numbered === 'dev') {
+    return {
+      numbers: parts[1],
+      modifier: 5,
+      modifierCount: 1,
+    };
+  }
+
+  var modifierLevel = 3;
+  var modifierLevelCount = 0;
+
+  if (parts.length > 1) {
+    var modifier = parts[parts.length - 1];
+    var firstLetter = modifier.charCodeAt(0);
+    var modifierLevelCountString;
+
+    // Modifiers: alpha < beta < RC < normal < patch < dev
+    if (firstLetter === 97) { // a
+      modifierLevel = 0;
+      if (/^alpha/.test(modifier)) {
+        modifierLevelCountString = + (modifier.slice(5));
+      } else {
+        modifierLevelCountString = + (modifier.slice(1));
+      }
+    } else if (firstLetter === 98) { // b
+      modifierLevel = 1;
+      if (/^beta/.test(modifier)) {
+        modifierLevelCountString = + (modifier.slice(4));
+      } else {
+        modifierLevelCountString = + (modifier.slice(1));
+      }
+    } else if (firstLetter === 82) { // R
+      modifierLevel = 2;
+      modifierLevelCountString = + (modifier.slice(2));
+    } else if (firstLetter === 112) { // p
+      modifierLevel = 4;
+      if (/^patch/.test(modifier)) {
+        modifierLevelCountString = + (modifier.slice(5));
+      } else {
+        modifierLevelCountString = + (modifier.slice(1));
+      }
+    } else if (firstLetter === 100) { // d
+      modifierLevel = 5;
+      if (/^dev/.test(modifier)) {
+        modifierLevelCountString = + (modifier.slice(3));
+      } else {
+        modifierLevelCountString = + (modifier.slice(1));
+      }
+    }
+
+    // If we got the empty string, it defaults to a modifier count of 1.
+    if (!modifierLevelCountString) {
+      modifierLevelCount = 1;
+    } else {
+      modifierLevelCount = + modifierLevelCountString;
+    }
+  }
+
+  // Try to convert to a list of numbers.
+  var toNum = function(s) {
+    var n = +s;
+    if (n !== n) {  // If n is NaN…
+      n = 0xffffffff;
+    }
+    return n;
+  };
+  var numberList = numbered.split('.').map(toNum);
+
+  return {
+    numbers: numberList,
+    modifier: modifierLevel,
+    modifierCount: modifierLevelCount,
+  };
+}
+
+function listCompare(a, b) {
+  for (var i = 0; i < a.length; i++) {
+    if (a[i] < b[i]) {
+      return -1;
+    } else if (a[i] > b[i]) {
+      return 1;
+    }
+  }
+  if (a.length < b.length) {
+    return -1;
+  } else if (a.length > b.length) {
+    return 1;
+  } else {
+    return 0;
+  }
+}
+
+// Return a negative value if v1 < v2,
+// zero if v1 = v2,
+// a positive value otherwise.
+//
+// See https://getcomposer.org/doc/04-schema.md#version
+// and https://github.com/badges/shields/issues/319#issuecomment-74411045
+function phpVersionCompare(v1, v2) {
+  // Omit the starting `v`.
+  var rawv1 = omitv(v1);
+  var rawv2 = omitv(v2);
+  try {
+    var v1data = phpNumberedVersionData(rawv1);
+    var v2data = phpNumberedVersionData(rawv2);
+  } catch(e) {
+    return asciiVersionCompare(rawv1, rawv2);
+  }
+
+  // Compare the numbered part (eg, 1.0.0 < 2.0.0).
+  var numbersCompare = listCompare(v1data.numbers, v2data.numbers);
+  if (numbersCompare !== 0) {
+    return numbersCompare;
+  }
+
+  // Compare the modifiers (eg, alpha < beta).
+  if (v1data.modifier < v2data.modifier) {
+    return -1;
+  } else if (v1data.modifier > v2data.modifier) {
+    return 1;
+  }
+
+  // Compare the modifier counts (eg, alpha1 < alpha3).
+  if (v1data.modifierCount < v2data.modifierCount) {
+    return -1;
+  } else if (v1data.modifierCount > v2data.modifierCount) {
+    return 1;
+  }
+
+  return 0;
+}
+
+function phpLatestVersion(versions) {
+  var latest = versions[0];
+  for (var i = 1; i < versions.length; i++) {
+    if (phpVersionCompare(latest, versions[i]) < 0) {
+      latest = versions[i];
+    }
+  }
+  return latest;
+}
+
+// Whether a version is stable.
+function phpStableVersion(version) {
+  var rawVersion = omitv(version);
+  try {
+    var versionData = phpNumberedVersionData(version);
+  } catch(e) {
+    return false;
+  }
+  // normal or patch
+  return (versionData.modifier === 3) || (versionData.modifier === 4);
 }
