@@ -19,30 +19,42 @@ var suggest = function(data, end, ask) {
   try {
     var url = nodeUrl.parse(data.url);
   } catch(e) { end({err:''+e}); return; }
-
-  if (url.hostname === 'github.com') {
-    github(url, end);
-  }
+  findSuggestions(url, end);
 };
 
 // url: string
 // cb: function({badges})
-var github = function(url, cb) {
+var findSuggestions = function(url, cb) {
   var userRepo = url.pathname.slice(1).split('/');
   var user = userRepo[0];
   var repo = userRepo[1];
-  Promise.all([
-    githubIssues(user, repo),
-    githubForks(user, repo),
-    githubStars(user, repo),
-    githubLicense(user, repo),
-  ]).then(function(badges) {
+  var promises = [];
+  if (url.hostname === 'github.com') {
+    promises = promises.concat([
+      githubIssues(user, repo),
+      githubForks(user, repo),
+      githubStars(user, repo),
+      githubLicense(user, repo),
+    ]);
+  }
+  promises.push(twitterPage(url));
+  Promise.all(promises).then(function(badges) {
     cb({badges:badges.filter(function(b) { return b != null; })});
   }).catch(function(err) {
     cb({badges:[], err:err});
   });
 };
 
+var twitterPage = function(url) {
+  var schema = url.protocol.slice(0, -1);
+  var host = url.host;
+  var path = url.path;
+  return Promise.resolve({
+    name: 'Twitter',
+    link: 'https://twitter.com/intent/tweet?text=Wow:&url=' + encodeURIComponent(url),
+    badge: 'https://img.shields.io/twitter/url/' + schema + '/' + host + path + '.svg?style=social',
+  });
+};
 var githubIssues = function(user, repo) {
   var userRepo = user + '/' + repo;
   return Promise.resolve({
@@ -173,11 +185,14 @@ var githubLicense = function(user, repo) {
 
 // Key phrases for common licenses
 var licensePhrases = {
-  'Apache 1.1': 'apache (software)? license,? (version)? 1\\.1',
-  'Apache 2': 'apache (software)? license,? (version)? 2',
+  'Apache 1.1': 'apache (software )?license,? (version)? 1\\.1',
+  'Apache 2': 'apache (software )?license,? (version)? 2',
   'Original BSD': 'all advertising materials mentioning features or use of this software must display the following acknowledgement',
   'New BSD': 'may be used to endorse or promote products derived from this software without specific prior written permission',
   'BSD': 'redistribution and use in source and binary forms, with or without modification, are permitted provided that the following conditions are met',
+  'AGPLv1': 'affero general public license,? version 1',
+  'AGPLv3': 'affero general public license,? version 3',
+  'AGPL': 'affero general public license',
   'GPLv2': 'gnu general public license,? version 2',
   'GPLv3': 'gnu general public license,? version 3',
   'GPL': 'gnu general public license',
@@ -193,9 +208,6 @@ var licensePhrases = {
   'Eclipse': 'eclipse public license',
   'Artistic': 'artistic license',
   'zlib': 'the origin of this software must not be misrepresented',
-  'AGPLv1': 'affero general public license,? version 1',
-  'AGPLv3': 'affero general public license,? version 3',
-  'AGPL': 'affero general public license',
   'ISC': 'permission to use, copy, modify, and/or distribute this software for any purpose with or without fee is hereby granted',
   'CC0': 'cc0',
   'Unlicense': 'this is free and unencumbered software released into the public domain',
